@@ -9,6 +9,7 @@ import pathlib
 
 from colcon_core.argument_default import is_default_value
 from colcon_core.argument_default import wrap_default_value
+from colcon_core.package_descriptor import PackageDescriptor
 from colcon_core.package_discovery import logger
 from colcon_core.package_discovery import PackageDiscoveryExtensionPoint
 from colcon_core.package_identification import identify
@@ -58,24 +59,35 @@ class MultiProcessRecursiveDiscoveryExtension(PackageDiscoveryExtensionPoint):
 
         loop = asyncio.get_event_loop()
         with concurrent.futures.ProcessPoolExecutor() as pool:
-            async def _discover_path(path):
-                try:
-                    result = await loop.run_in_executor(pool, identify, identification_extensions, path)
-                except IgnoreLocationException:
-                    return set()
-                if result:
-                    return set((result,))
+            tasks = set()
+            def _add_task_paths(paths):
+                for path in paths:
+                    tasks.add(loop.run_in_executor(pool, _discover_path, identification_extensions, path))
 
-                def subdirs():
-                    with os.scandir(path) as scanner:
-                        for entry in scanner:
-                            if entry.is_dir() and not entry.name.startswith('.'):
-                                yield path / entry.name
-                subdir_results = await _discover_paths(subdirs())
-                return set().union(subdir_results)
+            _add_task_paths(base_paths)
+            package_descriptors = set()
+            while tasks:
+                completed, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in completed:
+                    result = task.result()
+                    if isinstance(result, PackageDescriptor):
+                        package_descriptors.add(result)
+                    elif isinstance(result, list):
+                        _add_task_paths(result)
+                    else:
+                        assert result == None
+            return package_descriptors
 
-            async def _discover_paths(paths):
-                dir_results = await asyncio.gather(*[_discover_path(p) for p in paths])
-                return set().union(*dir_results)
+def _discover_path(identification_extensions, path):
+    # If we find a package at this location, return it; otherwise return a list
+    # of subdirectories found.
+    try:
+        result = identify(identification_extensions, path)
+    except IgnoreLocationException:
+        return None
+    if result:
+        return result
 
-            return await _discover_paths(pathlib.Path(p) for p in base_paths)
+    with os.scandir(path) as scanner:
+        return [entry.path for entry in scanner
+            if entry.is_dir() and not entry.name.startswith('.')]
